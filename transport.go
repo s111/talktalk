@@ -4,18 +4,36 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+const (
+	readWait  = 500 * time.Millisecond
+	writeWait = 500 * time.Millisecond
 )
 
 // NodeID node identifier.
 type NodeID int
 
-func (id NodeID) String() string {
-	return fmt.Sprintf("%d", id)
+// ErrInvalidID indicates a invalid NodeID.
+type ErrInvalidID NodeID
+
+func (id ErrInvalidID) Error() string {
+	return fmt.Sprintf("transport: invalid NodeID %d", id)
+}
+
+// ErrMissingAddr indicates a missing address for this node.
+type ErrMissingAddr NodeID
+
+func (id ErrMissingAddr) Error() string {
+	return fmt.Sprintf("transport: missing addr for NodeID %d", id)
 }
 
 // ClientID client identifier.
@@ -39,6 +57,12 @@ type MessageIn struct {
 	ClientID ClientID
 }
 
+// Transport errors.
+var (
+	ErrTransportNotStarted = errors.New("transport: Start() not called")
+	ErrTransportStopped    = errors.New("transport: Stop() called")
+)
+
 // Transport is a generic interface that abstracts
 // away the underlying network transfer mechanism.
 type Transport interface {
@@ -46,19 +70,29 @@ type Transport interface {
 	ID() NodeID
 
 	// Start should start listening for replica/client messages.
-	Start() error
+	// Must be run before any other method can be.
+	Start()
+
+	// Stop should stop accepting new connections.
+	// Close open connections.
+	// Make all goroutines return.
+	// Close listeners.
+	// Should block until done.
+	Stop()
 
 	// NotifyReplica should try to deliver a message to replica with id.
 	NotifyReplica(NodeID, *MessageOut)
+	// NotifyAllReplicas should try to deliver a message to all replicas.
+	NotifyAllReplicas(*MessageOut)
 	// NextReplicaMessage should return messages from replicas in FIFO order.
 	// Blocks till a message is received.
-	NextReplicaMessage() *MessageIn
+	NextReplicaMessage() (*MessageIn, error)
 
 	// NotifyClient should try to deliver a message to client with id.
 	NotifyClient(ClientID, *MessageOut)
 	// NextClientMessage should return messages from clients in FIFO order.
 	// Blocks till a message is received.
-	NextClientMessage() *MessageIn
+	NextClientMessage() (*MessageIn, error)
 }
 
 // NewTransport return an implementation of the Transport interface.
@@ -75,7 +109,7 @@ func NewTransport(id NodeID, nodes []string) (Transport, error) {
 func newTransport(id NodeID, nodes []string) (*transport, error) {
 	// Make sure id is valid.
 	if id < 1 {
-		return nil, errors.New("transport: NodeID must be >= 1, was: " + id.String())
+		return nil, ErrInvalidID(id)
 	}
 
 	addrs := make(map[NodeID]string)
@@ -87,29 +121,41 @@ func newTransport(id NodeID, nodes []string) (*transport, error) {
 
 	// Make sure we got this node's address.
 	if _, ok := addrs[id]; !ok {
-		return nil, errors.New("transport: Address missing for this node: " + id.String())
+		return nil, ErrMissingAddr(id)
+	}
+
+	udpAddrs := make(map[NodeID]*net.UDPAddr)
+
+	// Resolve all UDP addresses.
+	for id, addr := range addrs {
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+
+		if err != nil {
+			return nil, err
+		}
+
+		udpAddrs[id] = udpAddr
 	}
 
 	return &transport{
 		id:               id,
 		addr:             addrs[id],
-		addrs:            addrs,
-		udpAddrs:         make(map[NodeID]*net.UDPAddr),
+		udpAddrs:         udpAddrs,
 		replicaIncoming:  make(chan MessageIn, 4096),
 		registerClient:   make(chan *client),
 		unregisterClient: make(chan *client),
 		clients:          make(map[ClientID]*client),
 		clientOutgoing:   make(chan *MessageOut),
 		clientIncoming:   make(chan MessageIn, 4096),
+		stop:             make(chan int),
+		started:          make(chan int),
 	}, nil
 }
 
 type transport struct {
 	id NodeID
 
-	addr  string
-	addrs map[NodeID]string
-
+	addr     string
 	udpAddrs map[NodeID]*net.UDPAddr
 
 	replicaConn    net.PacketConn
@@ -117,52 +163,34 @@ type transport struct {
 
 	replicaIncoming chan MessageIn
 
+	clientConn io.Closer
+
 	registerClient   chan *client
 	unregisterClient chan *client
 	clients          map[ClientID]*client
 
 	clientOutgoing chan *MessageOut
 	clientIncoming chan MessageIn
+
+	// Closing this channel signals that it's time to stop.
+	stop chan int
+
+	routines sync.WaitGroup
+
+	// Closing this channel signals that the transport has started.
+	started chan int
 }
 
 func (t *transport) ID() NodeID {
 	return t.id
 }
 
-func (t *transport) Start() error {
-	// If incoming channels are not buffered, it's best not to start.
-	if cap(t.replicaIncoming) == 0 || cap(t.clientIncoming) == 0 {
-		return errors.New("incoming channels should be buffered")
-	}
-
-	err := t.startReplicaTransport()
-
-	if err != nil {
-		return err
-	}
-	go t.startClientHandler()
-	go t.startClientTransport()
-
-	return nil
-}
-
-func (t *transport) startReplicaTransport() error {
-	// Resolve all UDP addresses.
-	for id, addr := range t.addrs {
-		udpAddr, err := net.ResolveUDPAddr("udp", addr)
-
-		if err != nil {
-			return err
-		}
-
-		t.udpAddrs[id] = udpAddr
-	}
-
+func (t *transport) Start() {
 	// Listen for replica messages.
 	conn, err := net.ListenUDP("udp", t.udpAddrs[t.id])
 
-	if err != nil {
-		return err
+	if err != nil || conn == nil {
+		panic(err)
 	}
 
 	t.replicaConn = conn
@@ -171,21 +199,38 @@ func (t *transport) startReplicaTransport() error {
 	// Read incoming replica messages.
 	go t.replicaRead()
 
-	return nil
+	go t.startClientHandler()
+	go t.startClientTransport()
+
+	<-t.started
 }
 
 func (t *transport) replicaRead() {
+	t.routines.Add(1)
+	defer t.routines.Done()
+
 	var message MessageIn
 
 	for {
+		t.replicaConn.SetReadDeadline(time.Now().Add(readWait))
 		err := t.replicaDecoder.Decode(&message)
+
+		select {
+		case <-t.stop:
+			return
+		default:
+		}
 
 		if err != nil {
 			// Ignore failed messages, they should be re-transmitted.
 			continue
 		}
 
-		t.replicaIncoming <- message
+		select {
+		case t.replicaIncoming <- message:
+		case <-t.stop:
+			return
+		}
 
 		// Don't want to leak data from an old message.
 		message.Data = nil
@@ -193,34 +238,63 @@ func (t *transport) replicaRead() {
 }
 
 func (t *transport) startClientTransport() {
-	server := http.NewServeMux()
-	server.HandleFunc("/ws", t.serveWebSocket)
+	t.routines.Add(1)
+	defer t.routines.Done()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", t.serveWebSocket)
+
+	conn, err := net.Listen("tcp", t.addr)
+
+	if err != nil || conn == nil {
+		panic(err)
+	}
+
+	t.clientConn = conn
+	close(t.started)
 
 	// Blocks
-	err := http.ListenAndServe(t.addr, server)
+	http.Serve(conn, mux)
 
-	log.Println("Shutting down http server")
-	// err is always non-nil
-	log.Println(err)
+	log.Println("transport: shutdown http server.")
 }
 
 func (t *transport) startClientHandler() {
+	t.routines.Add(1)
+	defer t.routines.Done()
+
 	for {
 		select {
 		case client := <-t.registerClient:
 			if _, ok := t.clients[client.id]; !ok {
 				t.clients[client.id] = client
+				client.ok <- true
 			} else {
-				log.Println("Already have a connection for client:", client.id)
+				log.Println("transport: already have a connection for client:", client.id)
+				client.ok <- false
 			}
+
 		case client := <-t.unregisterClient:
 			delete(t.clients, client.id)
+
 		case message := <-t.clientOutgoing:
 			if client, ok := t.clients[message.clientID]; ok {
-				client.outgoing <- message
+				select {
+				case client.outgoing <- message:
+				case <-t.stop:
+				}
 			} else {
-				log.Println("Tried to send:", message)
-				log.Println("Client no longer connected.")
+				log.Printf("transport: tried to send to disconnected client %q: %+v", client.id, message)
+			}
+
+		case <-t.stop:
+			for {
+				if len(t.clients) == 0 {
+					return
+				}
+
+				client := <-t.unregisterClient
+				delete(t.clients, client.id)
 			}
 		}
 	}
@@ -229,10 +303,13 @@ func (t *transport) startClientHandler() {
 var upgrader = websocket.Upgrader{}
 
 func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+	t.routines.Add(1)
+	defer t.routines.Done()
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 
 	if err != nil {
-		log.Println("upgrade:", err)
+		log.Println("transport: upgrade:", err)
 
 		return
 	}
@@ -245,16 +322,15 @@ func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var message MessageIn
 
+	ws.SetReadDeadline(time.Now().Add(readWait))
 	err = ws.ReadJSON(&message)
 
 	if err != nil {
-		log.Println(err)
-
 		return
 	}
 
 	if len(message.ClientID) == 0 {
-		log.Println("Message from client missing ClientID:", message)
+		log.Println("transport: message from client missing ClientID:", message)
 
 		return
 	}
@@ -262,15 +338,35 @@ func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	client := &client{
 		id:       message.ClientID,
 		conn:     ws,
+		ok:       make(chan bool),
 		outgoing: make(chan *MessageOut),
 		incoming: t.clientIncoming,
+		stop:     t.stop,
+		routines: &t.routines,
 	}
 
 	// Register the client so that we can respond to it later.
-	t.registerClient <- client
+	select {
+	case t.registerClient <- client:
+	case <-t.stop:
+		return
+	}
+
+	// Client was rejected.
+	if !<-client.ok {
+		return
+	}
 
 	// Deliver the message we just read.
-	go func() { t.clientIncoming <- message }()
+	go func() {
+		t.routines.Add(1)
+		defer t.routines.Done()
+
+		select {
+		case t.clientIncoming <- message:
+		case <-t.stop:
+		}
+	}()
 
 	go client.write()
 	client.read()
@@ -278,35 +374,111 @@ func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	t.unregisterClient <- client
 }
 
+func (t *transport) NotifyAllReplicas(message *MessageOut) {
+	for id := range t.udpAddrs {
+		t.NotifyReplica(id, message)
+	}
+}
+
 func (t *transport) NotifyReplica(nodeID NodeID, message *MessageOut) {
+	select {
+	case <-t.started:
+	default:
+		panic(ErrTransportNotStarted)
+	}
+
 	encoded, err := json.Marshal(*message)
 
-	// This should not happen.
 	if err != nil {
-		// Ignore message if it somehow does, but log it.
-		log.Println("Could not marshal message:", err)
+		log.Println("transport: could not marshal message:", err)
 
 		return
 	}
 
-	// We don't care if this succeeds or not, so we ignore the error returned.
+	t.replicaConn.SetWriteDeadline(time.Now().Add(writeWait))
 	t.replicaConn.WriteTo(encoded, t.udpAddrs[nodeID])
 }
 
-func (t *transport) NextReplicaMessage() *MessageIn {
-	message := <-t.replicaIncoming
+func (t *transport) NextReplicaMessage() (*MessageIn, error) {
+	select {
+	case <-t.started:
+	default:
+		panic(ErrTransportNotStarted)
+	}
 
-	return &message
+	select {
+	case <-t.stop:
+		return nil, ErrTransportStopped
+	default:
+	}
+
+	select {
+	case message, ok := <-t.replicaIncoming:
+		if ok {
+			return &message, nil
+		}
+	}
+
+	return nil, ErrTransportStopped
 }
 
 func (t *transport) NotifyClient(clientID ClientID, message *MessageOut) {
+	select {
+	case <-t.started:
+	default:
+		panic(ErrTransportNotStarted)
+	}
+
 	message.clientID = clientID
 
-	t.clientOutgoing <- message
+	select {
+	case t.clientOutgoing <- message:
+	case <-t.stop:
+	}
 }
 
-func (t *transport) NextClientMessage() *MessageIn {
-	message := <-t.clientIncoming
+func (t *transport) NextClientMessage() (*MessageIn, error) {
+	select {
+	case <-t.started:
+	default:
+		panic(ErrTransportNotStarted)
+	}
 
-	return &message
+	select {
+	case <-t.stop:
+		return nil, ErrTransportStopped
+	default:
+	}
+
+	select {
+	case message, ok := <-t.clientIncoming:
+		if ok {
+			return &message, nil
+		}
+	}
+
+	return nil, ErrTransportStopped
+}
+
+func (t *transport) Stop() {
+	select {
+	case <-t.started:
+	default:
+		panic(ErrTransportNotStarted)
+	}
+
+	log.Println(ErrTransportStopped)
+
+	close(t.stop)
+	close(t.replicaIncoming)
+	close(t.clientIncoming)
+
+	log.Println("transport: closing connections")
+
+	t.clientConn.Close()
+	t.replicaConn.Close()
+
+	log.Println("transport: waiting for routines to return")
+
+	t.routines.Wait()
 }

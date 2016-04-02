@@ -2,124 +2,428 @@ package talktalk
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-func TestReplicaTransport(t *testing.T) {
-	// Third node added but not started,
-	// this is to make sure there is no failure,
-	// if the node can't be reached.
+func TestNewTransportInvalidID(t *testing.T) {
+	var idTests = []struct {
+		in  NodeID
+		out error
+	}{
+		{0, ErrInvalidID(0)},
+		{-1, ErrInvalidID(-1)},
+	}
+
 	nodes := []string{":8081", ":8082", ":8083"}
 
-	nodeA := createTransport(t, 1, nodes)
-	nodeB := createTransport(t, 2, nodes)
+	for _, tt := range idTests {
+		_, err := NewTransport(tt.in, nodes)
 
-	startTransport(t, nodeA)
-	startTransport(t, nodeB)
-
-	messageA := &MessageOut{
-		Type: 1,
-		Data: "message A",
+		if err != tt.out {
+			t.Errorf("NewTransport(%d, nodes) => _, %q, want %q", tt.in, err, tt.out)
+		}
 	}
-
-	messageB := &MessageOut{
-		Type: 1,
-		Data: "message B",
-	}
-
-	sendReplicaMessage(t, nodeA, nodeB, messageA)
-	sendReplicaMessage(t, nodeB, nodeA, messageB)
 }
 
-func TestClientTransport(t *testing.T) {
-	// Second node added but not started,
-	// this is to make sure there is no failure,
-	// if the node can't be reached.
-	// Client needs full address, so localhost is added to the first node.
-	// Transport should handle it fine.
-	nodes := []string{"localhost:8084", ":8085"}
+func TestNewTransportMissingAddr(t *testing.T) {
+	id := NodeID(4)
+	nodes := []string{":8081", ":8082", ":8083"}
 
-	nodeA := createTransport(t, 1, nodes)
+	_, err := NewTransport(id, nodes)
 
-	startTransport(t, nodeA)
+	if err != ErrMissingAddr(id) {
+		t.Errorf("NewTransport(%d, nodes) => _, %q, want %q", id, err, ErrMissingAddr(id))
+	}
+}
 
-	// Give http server time to start.
+func TestNewTransportInvalidAddr(t *testing.T) {
+	id := NodeID(1)
+	nodes := []string{"#INVALID#", ":8082", ":8083"}
+
+	_, err := NewTransport(id, nodes)
+
+	if err == nil {
+		t.Errorf("NewTransport(%d, %v) => _, %q, want error", id, nodes, err)
+	}
+}
+
+func TestNodeID(t *testing.T) {
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transport, _ := NewTransport(id, nodes)
+	got := transport.ID()
+
+	if got != 1 {
+		t.Errorf("NewTransport(%d, nodes).ID() produced %+v expected %+v", id, got, id)
+	}
+}
+
+func TestTransportStartStop(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panicked: %v", r)
+		}
+	}()
+
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transport, _ := newTransport(id, nodes)
+	transport.Start()
+
+	done := make(chan bool)
+
+	go func() {
+		transport.Stop()
+		done <- true
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Millisecond * 10):
+		t.Error("Stop() didn't finish in time")
+	}
+}
+
+func TestTransportStopBeforeStart(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("calling Stop() before Start() should cause a panick")
+		}
+	}()
+
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transport, _ := newTransport(id, nodes)
+	transport.Stop()
+}
+
+func TestNotifyReplicaBeforeStart(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("calling NotifyReplica() before Start() should cause a panick")
+		}
+	}()
+
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transport, _ := newTransport(id, nodes)
+	transport.NotifyReplica(id, &MessageOut{})
+}
+
+func TestNotifyClientBeforeStart(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("calling NotifyClient() before Start() should cause a panick")
+		}
+	}()
+
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	client := ClientID("test client")
+
+	transport, _ := newTransport(id, nodes)
+	transport.NotifyClient(client, &MessageOut{})
+}
+
+func TestNextReplicaMessageBeforeStart(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("calling NextReplicaMessage() before Start() should cause a panick")
+		}
+	}()
+
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transport, _ := newTransport(id, nodes)
+	transport.NextReplicaMessage()
+}
+
+func TestNextClientMessageBeforeStart(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("calling NextClientMessage() before Start() should cause a panick")
+		}
+	}()
+
+	id := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transport, _ := newTransport(id, nodes)
+	transport.NextClientMessage()
+}
+
+func TestReplicaMessageExchange(t *testing.T) {
+	nodeA := NodeID(1)
+	nodeB := NodeID(2)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transportA, _ := NewTransport(nodeA, nodes)
+	transportB, _ := NewTransport(nodeB, nodes)
+
+	transportA.Start()
+	transportB.Start()
+
+	message := &MessageOut{
+		Type: 1,
+		Data: "some data",
+	}
+
+	encoded, _ := json.Marshal(message.Data)
+
+	expectedMessage := &MessageIn{
+		Type: message.Type,
+		Data: encoded,
+	}
+
+	transportA.NotifyReplica(nodeB, message)
+
+	receivedMessage, _ := transportB.NextReplicaMessage()
+
+	if !reflect.DeepEqual(expectedMessage, receivedMessage) {
+		t.Errorf("NextReplicaMessage() => %q, _, want %q", receivedMessage, expectedMessage)
+	}
+
+	transportA.Stop()
+	transportB.Stop()
+}
+
+func TestNotifyAllReplicas(t *testing.T) {
+	nodeA := NodeID(1)
+	nodeB := NodeID(2)
+	nodeC := NodeID(3)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transportA, _ := NewTransport(nodeA, nodes)
+	transportB, _ := NewTransport(nodeB, nodes)
+	transportC, _ := NewTransport(nodeC, nodes)
+
+	transportA.Start()
+	transportB.Start()
+	transportC.Start()
+
+	message := &MessageOut{
+		Type: 1,
+		Data: "some data",
+	}
+
+	encoded, _ := json.Marshal(message.Data)
+
+	expectedMessage := &MessageIn{
+		Type: message.Type,
+		Data: encoded,
+	}
+
+	transportA.NotifyAllReplicas(message)
+
+	receivedMessageA, _ := transportA.NextReplicaMessage()
+	receivedMessageB, _ := transportB.NextReplicaMessage()
+	receivedMessageC, _ := transportC.NextReplicaMessage()
+
+	if !reflect.DeepEqual(expectedMessage, receivedMessageA) {
+		t.Errorf("NextReplicaMessage() => %q, _, want %q", receivedMessageA, expectedMessage)
+	}
+
+	if !reflect.DeepEqual(expectedMessage, receivedMessageB) {
+		t.Errorf("NextReplicaMessage() => %q, _, want %q", receivedMessageA, expectedMessage)
+	}
+
+	if !reflect.DeepEqual(expectedMessage, receivedMessageC) {
+		t.Errorf("NextReplicaMessage() => %q, _, want %q", receivedMessageA, expectedMessage)
+	}
+
+	transportA.Stop()
+	transportB.Stop()
+	transportC.Stop()
+}
+
+func TestAddressAlreadyInUse(t *testing.T) {
+	nodeA := NodeID(1)
+	nodeB := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transportA, _ := NewTransport(nodeA, nodes)
+	transportB, _ := NewTransport(nodeB, nodes)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("calling Start() on two nodes with the same adress should cause a panick")
+		}
+
+		transportA.Stop()
+	}()
+
+	transportA.Start()
+	transportB.Start()
+}
+
+func TestTransportStopBeforeReceive(t *testing.T) {
+	nodeA := NodeID(1)
+	nodeB := NodeID(2)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	transportA, _ := NewTransport(nodeA, nodes)
+	transportB, _ := NewTransport(nodeB, nodes)
+
+	transportA.Start()
+	transportB.Start()
+
+	message := &MessageOut{
+		Type: 1,
+		Data: "some data",
+	}
+
+	transportA.NotifyReplica(nodeB, message)
+
+	transportB.Stop()
+
+	_, err := transportB.NextReplicaMessage()
+
+	if err != ErrTransportStopped {
+		t.Errorf("NextReplicaMessage() => _, %q, want %q", err, ErrTransportStopped)
+	}
+
+	transportA.Stop()
+}
+
+func TestClientMessageExchange(t *testing.T) {
+	nodeA := NodeID(1)
+	nodes := []string{":8081", ":8082", ":8083"}
+
+	client := ClientID("test client")
+
+	transportA, _ := newTransport(nodeA, nodes)
+
+	transportA.Start()
+
+	clientConn, _, err := websocket.DefaultDialer.Dial(toWSAddr(nodes[0]), nil)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(transportA.clients) != 0 {
+		t.Error("a client should not be registered until it has sent it's ClientID")
+	}
+
+	message := &struct {
+		Type     int
+		ClientID ClientID
+		Data     interface{}
+	}{
+		Type:     1,
+		ClientID: client,
+		Data:     "some data",
+	}
+
+	clientConn.SetWriteDeadline(time.Now().Add(writeWait))
+	err = clientConn.WriteJSON(message)
+
+	// Send twice
+	clientConn.SetWriteDeadline(time.Now().Add(writeWait))
+	err = clientConn.WriteJSON(message)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstMessage, err := transportA.NextClientMessage()
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Give Transport some time to register client
 	<-time.After(time.Millisecond * 10)
 
-	client, _, err := websocket.DefaultDialer.Dial("ws://"+nodes[0]+"/ws", nil)
-
-	if err != nil {
-		t.Fatal(err, "\nHttp server probably didn't get time to start.")
+	if len(transportA.clients) != 1 {
+		t.Error("client was not registered")
 	}
 
-	clientID := "test client"
-	payload := "test message"
-	message := "{\"type\": 1, \"data\": \"" + payload + "\", \"clientID\": \"" + clientID + "\"}"
-
-	err = client.WriteMessage(websocket.TextMessage, []byte(message))
+	secondMessage, err := transportA.NextClientMessage()
 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	received := nodeA.NextClientMessage()
+	if !reflect.DeepEqual(firstMessage, secondMessage) {
+		t.Error("second client message received didn't match first one")
+	}
 
-	var receivedData string
+	transportA.NotifyClient(client, &MessageOut{
+		Type: 1,
+		Data: "some data",
+	})
 
-	err = json.Unmarshal(received.Data, &receivedData)
+	var receivedMessage MessageIn
+
+	clientConn.SetReadDeadline(time.Now().Add(readWait))
+	err = clientConn.ReadJSON(&receivedMessage)
 
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Check that id match.
-	if ClientID(clientID) != received.ClientID {
-		t.Errorf("Expected '%s' as ClientID received '%s'", clientID, received.ClientID)
-	}
-
-	// Check that data match.
-	if payload != receivedData {
-		t.Errorf("Sent '%s' to nodeA received '%s'", payload, receivedData)
-	}
-}
-
-func createTransport(t *testing.T, id NodeID, nodes []string) Transport {
-	transport, err := NewTransport(id, nodes)
-
-	if err != nil {
-		t.Fatal("NewTransport failed:", err)
-	}
-
-	return transport
-}
-
-func startTransport(t *testing.T, transport Transport) {
-	err := transport.Start()
-
-	if err != nil {
-		t.Fatal("Could not start transport:", err)
-	}
-}
-
-func sendReplicaMessage(t *testing.T, from Transport, to Transport, message *MessageOut) {
-	// Send message.
-	from.NotifyReplica(to.ID(), message)
-	// Receive message.
-	messageReceived := to.NextReplicaMessage()
-
 	var receivedData string
 
-	err := json.Unmarshal(messageReceived.Data, &receivedData)
+	json.Unmarshal(receivedMessage.Data, &receivedData)
 
-	if err != nil {
-		t.Fatal("Could not decode data:", err)
+	if receivedData != message.Data {
+		t.Error("received data didn't match data sent")
 	}
 
-	// Check that they match.
-	if message.Data != receivedData {
-		t.Errorf("Sent '%s' to nodeB received '%s'", message.Data, receivedData)
+	clientConn.Close()
+
+	// Give Transport some time to unregister client
+	<-time.After(time.Millisecond * 10)
+
+	if len(transportA.clients) != 0 {
+		t.Error("client was not unregistered")
 	}
+
+	transportA.Stop()
+}
+
+func toWSAddr(addr string) string {
+	return "ws://" + addr + "/ws"
+}
+
+func BenchmarkSendReceive1500(b *testing.B) {
+	nodeA := NodeID(1)
+	nodeB := NodeID(2)
+	nodes := []string{":8081", ":8082"}
+
+	transportA, _ := NewTransport(nodeA, nodes)
+	transportB, _ := NewTransport(nodeB, nodes)
+
+	transportA.Start()
+	transportB.Start()
+
+	message := &MessageOut{
+		Type: 1,
+		Data: "some data",
+	}
+
+	b.ResetTimer()
+
+	for n := 0; n < b.N; n++ {
+		for i := 0; i < 1500; i++ {
+			transportA.NotifyReplica(nodeB, message)
+			transportB.NextReplicaMessage()
+		}
+	}
+
+	b.StopTimer()
+
+	transportA.Stop()
+	transportB.Stop()
 }
