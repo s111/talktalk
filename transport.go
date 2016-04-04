@@ -300,7 +300,11 @@ func (t *transport) startClientHandler() {
 	}
 }
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
 
 func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	t.routines.Add(1)
