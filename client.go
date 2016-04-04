@@ -28,12 +28,11 @@ func (c *client) write() {
 	for {
 		select {
 		case message := <-c.outgoing:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			c.conn.WriteJSON(message)
 
 		case <-c.stop:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			// Fail all further reads.
+			c.conn.SetReadDeadline(time.Now())
 
 			return
 		}
@@ -44,14 +43,7 @@ func (c *client) read() {
 	var message MessageIn
 
 	for {
-		c.conn.SetReadDeadline(time.Now().Add(readWait))
 		err := c.conn.ReadJSON(&message)
-
-		select {
-		case <-c.stop:
-			return
-		default:
-		}
 
 		if err != nil {
 			return

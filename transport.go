@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	readWait  = 500 * time.Millisecond
-	writeWait = 500 * time.Millisecond
+	readWait  = 2000 * time.Millisecond
+	writeWait = 2000 * time.Millisecond
 )
 
 // NodeID node identifier.
@@ -322,6 +322,7 @@ func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var message MessageIn
 
+	// Only wait 'readWait' for the first message.
 	ws.SetReadDeadline(time.Now().Add(readWait))
 	err = ws.ReadJSON(&message)
 
@@ -367,6 +368,9 @@ func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		case <-t.stop:
 		}
 	}()
+
+	// Keep connection open for ever.
+	ws.SetReadDeadline(time.Time{})
 
 	go client.write()
 	client.read()
