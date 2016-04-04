@@ -284,7 +284,7 @@ func (t *transport) startClientHandler() {
 				case <-t.stop:
 				}
 			} else {
-				log.Printf("transport: tried to send to disconnected client %q: %+v", client.id, message)
+				log.Printf("transport: tried to send to disconnected client: %+v", message)
 			}
 
 		case <-t.stop:
