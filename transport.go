@@ -41,8 +41,8 @@ type ClientID string
 
 // MessageOut wraps data with its type.
 type MessageOut struct {
-	Type int         `json:"type"`
-	Data interface{} `json:"data"`
+	Type int
+	Data interface{}
 
 	clientID ClientID
 }
