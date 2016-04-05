@@ -28,7 +28,12 @@ func (c *client) write() {
 	for {
 		select {
 		case message := <-c.outgoing:
-			c.conn.WriteJSON(message)
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			err := c.conn.WriteJSON(message)
+
+			if err != nil {
+				return
+			}
 
 		case <-c.stop:
 			// Fail all further reads.
