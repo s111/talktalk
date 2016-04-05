@@ -90,6 +90,8 @@ type Transport interface {
 
 	// NotifyClient should try to deliver a message to client with id.
 	NotifyClient(ClientID, *MessageOut)
+	// NotifyAllClients should try to deliver a message to all clients.
+	NotifyAllClients(*MessageOut)
 	// NextClientMessage should return messages from clients in FIFO order.
 	// Blocks till a message is received.
 	NextClientMessage() (*MessageIn, error)
@@ -146,6 +148,7 @@ func newTransport(id NodeID, nodes []string) (*transport, error) {
 		unregisterClient: make(chan *client),
 		clients:          make(map[ClientID]*client),
 		clientOutgoing:   make(chan *MessageOut),
+		clientBroadcast:  make(chan *MessageOut),
 		clientIncoming:   make(chan MessageIn, 4096),
 		stop:             make(chan int),
 		started:          make(chan int),
@@ -169,8 +172,9 @@ type transport struct {
 	unregisterClient chan *client
 	clients          map[ClientID]*client
 
-	clientOutgoing chan *MessageOut
-	clientIncoming chan MessageIn
+	clientOutgoing  chan *MessageOut
+	clientBroadcast chan *MessageOut
+	clientIncoming  chan MessageIn
 
 	// Closing this channel signals that it's time to stop.
 	stop chan int
@@ -281,10 +285,22 @@ func (t *transport) startClientHandler() {
 			if client, ok := t.clients[message.clientID]; ok {
 				select {
 				case client.outgoing <- message:
-				case <-t.stop:
+				default:
 				}
 			} else {
 				log.Printf("transport: tried to send to disconnected client: %+v", message)
+			}
+
+		case message := <-t.clientBroadcast:
+			for clientID := range t.clients {
+				if client, ok := t.clients[clientID]; ok {
+					select {
+					case client.outgoing <- message:
+					default:
+					}
+				} else {
+					log.Printf("transport: tried to send to disconnected client: %+v", message)
+				}
 			}
 
 		case <-t.stop:
@@ -344,7 +360,7 @@ func (t *transport) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		id:       message.ClientID,
 		conn:     ws,
 		ok:       make(chan bool),
-		outgoing: make(chan *MessageOut),
+		outgoing: make(chan *MessageOut, 4096),
 		incoming: t.clientIncoming,
 		stop:     t.stop,
 		routines: &t.routines,
@@ -386,6 +402,10 @@ func (t *transport) NotifyAllReplicas(message *MessageOut) {
 	for id := range t.udpAddrs {
 		t.NotifyReplica(id, message)
 	}
+}
+
+func (t *transport) NotifyAllClients(message *MessageOut) {
+	t.clientBroadcast <- message
 }
 
 func (t *transport) NotifyReplica(nodeID NodeID, message *MessageOut) {
