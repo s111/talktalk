@@ -32,6 +32,8 @@ func (c *client) write() {
 
 		case <-c.stop:
 			// Fail all further reads.
+			// BUG: SetReadDeadline and ReadJSON are called concurrently.
+			// FIX: Use ping pong instead.
 			c.conn.SetReadDeadline(time.Now())
 
 			return
