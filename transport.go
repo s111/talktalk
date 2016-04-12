@@ -161,8 +161,7 @@ type transport struct {
 	addr     string
 	udpAddrs map[NodeID]*net.UDPAddr
 
-	replicaConn    net.PacketConn
-	replicaDecoder *json.Decoder
+	replicaConn net.PacketConn
 
 	replicaIncoming chan MessageIn
 
@@ -198,7 +197,6 @@ func (t *transport) Start() {
 	}
 
 	t.replicaConn = conn
-	t.replicaDecoder = json.NewDecoder(conn)
 
 	// Read incoming replica messages.
 	go t.replicaRead()
@@ -214,16 +212,24 @@ func (t *transport) replicaRead() {
 	defer t.routines.Done()
 
 	var message MessageIn
+	buffer := make([]byte, 8192)
 
 	for {
 		t.replicaConn.SetReadDeadline(time.Now().Add(readWait))
-		err := t.replicaDecoder.Decode(&message)
+		n, _, err := t.replicaConn.ReadFrom(buffer)
 
 		select {
 		case <-t.stop:
 			return
 		default:
 		}
+
+		if err != nil {
+			// Ignore failed messages, they should be re-transmitted.
+			continue
+		}
+
+		err = json.Unmarshal(buffer[:n], &message)
 
 		if err != nil {
 			// Ignore failed messages, they should be re-transmitted.
